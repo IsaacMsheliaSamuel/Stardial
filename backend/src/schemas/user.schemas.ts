@@ -16,6 +16,16 @@ export const userRegistrationSchema = z.object({
   email: z.string().email("Invalid email format").optional(),
   alias: z.string().min(1, "Alias is required").max(64, "Alias must be at most 64 characters").optional(),
   role: z.enum(USER_ROLES).default(DEFAULT_USER_ROLE),
+  /**
+   * Optional password for email+password authentication (#6).
+   * When provided it is hashed with bcrypt (cost 12) before storage.
+   * Accounts without a password can still authenticate via wallet address.
+   */
+  password: z
+    .string()
+    .min(8, "Password must be at least 8 characters")
+    .max(72, "Password must be at most 72 characters")
+    .optional(),
 });
 
 

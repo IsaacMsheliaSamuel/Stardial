@@ -1,6 +1,6 @@
 import { Router, type NextFunction, type Request, type Response } from "express";
 import { z } from "zod";
-import { getDataSource } from "../services/database.js";
+import { getDataSource, withTransaction } from "../services/database.js";
 import { User } from "../entities/User.js";
 import {
   getEmailProvider,
@@ -25,6 +25,7 @@ import {
   issueEmailVerificationToken,
   rotateEmailVerificationToken,
 } from "../services/email-verification-token.js";
+import { hashPassword } from "../services/password.js";
 
 export const authEmailRouter = Router();
 
@@ -92,30 +93,57 @@ authEmailRouter.post("/password-reset/request", async (req: Request, res: Respon
 });
 
 /**
- * Confirms a password reset and revokes sessions (#1446).
+ * Confirms a password reset, stores the new bcrypt hash, and revokes sessions
+ * (#1446, #6).
  *
- * On success, every wallet JWT issued to every account registered with the
- * token's email is invalidated (their `sessionVersion` is bumped), and no new
- * session is issued: the user has to log in again. The bump also makes the
- * reset token single-use, so a replayed or concurrent confirm with the same
- * token gets `400 invalid_or_expired_token`.
+ * On success:
+ *  - The new password is hashed with bcrypt (cost 12) and written to every
+ *    User row associated with the token's email address.
+ *  - Every wallet JWT for those accounts is invalidated by bumping their
+ *    `sessionVersion`, forcing re-authentication.
+ *  - The token is single-use: a replayed or concurrent confirm with the same
+ *    token gets `400 invalid_or_expired_token` because the `sv` bump means
+ *    `revokeSessionsForEmail` will find 0 matching rows.
  *
- * Not affected, on purpose: invitation and email verification tokens (they
+ * Not affected, on purpose: invitation and email-verification tokens (they
  * aren't sessions), and accounts registered under a different email.
  */
 authEmailRouter.post("/password-reset/confirm", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { token } = passwordResetConfirmSchema.parse(req.body);
+    const { token, newPassword } = passwordResetConfirmSchema.parse(req.body);
     const payload = verifyEmailFlowToken(token, "password_reset");
     if (!payload) {
       logAuthEvent(res, "password_reset_confirmed", "failure", { reason: "invalid_or_expired_token" });
       return res.status(400).json({ error: "invalid_or_expired_token", requestId: res.locals.requestId });
     }
 
+    // Hash before the transaction; bcrypt is intentionally slow and we
+    // want the DB transaction to be as short as possible.
+    const passwordHash = await hashPassword(newPassword);
+
     // Tokens issued before #1446 carry no `sv`; they were issued against version 0.
-    const revoked = await revokeSessionsForEmail(payload.email, payload.sv ?? 0);
+    const revoked = await withTransaction(async (queryRunner) => {
+      const userRepo = queryRunner.manager.getRepository(User);
+
+      // Atomically bump sessionVersion (revoke old JWTs) and store the new hash.
+      const result = await userRepo
+        .createQueryBuilder()
+        .update(User)
+        .set({
+          passwordHash,
+          sessionVersion: () => `"sessionVersion" + 1`,
+        })
+        .where("email = :email AND sessionVersion = :sv", {
+          email: payload.email,
+          sv: payload.sv ?? 0,
+        })
+        .execute();
+
+      return result.affected ?? 0;
+    });
+
     if (revoked === 0) {
-      // Already used, superseded by a newer reset, or no account left for this email.
+      // Already used, superseded by a newer reset, or no account for this email.
       logAuthEvent(res, "password_reset_confirmed", "failure", { email: payload.email, reason: "invalid_or_expired_token" });
       return res.status(400).json({ error: "invalid_or_expired_token", requestId: res.locals.requestId });
     }

@@ -13,6 +13,7 @@ import { signToken } from "../services/jwt.js";
 import { authJwtMiddleware } from "../middleware/auth-jwt.js";
 import { logAuthEvent } from "../services/auth-events.js";
 import { loginAttemptStore } from "../services/login-attempts.js";
+import { hashPassword, verifyPassword } from "../services/password.js";
 
 export const usersRouter = Router();
 
@@ -25,7 +26,7 @@ export const usersRouter = Router();
  */
 usersRouter.post("/register", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const { walletAddress, email, alias, role } = userRegistrationSchema.parse(req.body);
+    const { walletAddress, email, alias, role, password } = userRegistrationSchema.parse(req.body);
 
     // Get repository without opening a transaction
     const dataSource = getDataSource();
@@ -43,6 +44,10 @@ usersRouter.post("/register", async (req: Request, res: Response, next: NextFunc
       });
     }
 
+    // Hash the password before entering the transaction so the transaction
+    // is as short as possible (bcrypt is intentionally slow).
+    const passwordHash = password ? await hashPassword(password) : null;
+
     // Only open a transaction if the wallet does not already exist
     const savedUser = await withTransaction(async (queryRunner) => {
       const userRepository = queryRunner.manager.getRepository(User);
@@ -53,6 +58,7 @@ usersRouter.post("/register", async (req: Request, res: Response, next: NextFunc
         alias,
         role,
         isActive: true,
+        passwordHash,
       });
 
       return await userRepository.save(newUser);
@@ -87,24 +93,61 @@ usersRouter.post("/register", async (req: Request, res: Response, next: NextFunc
  */
 usersRouter.post("/login", async (req: Request, res: Response, next: NextFunction) => {
   try {
-    const loginSchema = z.object({
-      walletAddress: stellarAddressSchema
-    });
+    const loginSchema = z.union([
+      // Wallet-address login (existing flow — unchanged)
+      z.object({
+        walletAddress: stellarAddressSchema,
+        password: z.string().optional(),
+      }),
+      // Email + password login
+      z.object({
+        email: z.string().email("Invalid email format"),
+        password: z.string().min(1, "Password is required"),
+      }),
+    ]);
 
-    const { walletAddress } = loginSchema.parse(req.body);
-    const authenticated = await loginAttemptStore.attempt(walletAddress, async () => {
-      const user = await getDataSource().getRepository(User).findOne({
-        where: { walletAddress, deletedAt: IsNull() }
-      });
-      if (!user || !user.isActive) return null;
-      return { user, token: signToken(user.walletAddress) };
-    });
+    const body = loginSchema.parse(req.body);
+
+    const authenticated = await loginAttemptStore.attempt(
+      "walletAddress" in body ? body.walletAddress : body.email,
+      async () => {
+        let user: User | null = null;
+
+        if ("walletAddress" in body) {
+          // --- Wallet-address flow ---
+          user = await getDataSource().getRepository(User).findOne({
+            where: { walletAddress: body.walletAddress, deletedAt: IsNull() },
+          });
+          if (!user || !user.isActive) return null;
+
+          // If the account has a password set, require it.
+          if (user.passwordHash) {
+            if (!body.password || !(await verifyPassword(body.password, user.passwordHash))) {
+              return null;
+            }
+          }
+        } else {
+          // --- Email + password flow ---
+          user = await getDataSource().getRepository(User).findOne({
+            where: { email: body.email, deletedAt: IsNull() },
+          });
+          if (!user || !user.isActive) return null;
+
+          // Email login requires a password hash to be set.
+          if (!await verifyPassword(body.password, user.passwordHash)) {
+            return null;
+          }
+        }
+
+        return { user, token: signToken(user.walletAddress, user.sessionVersion ?? 0) };
+      },
+    );
 
     if (!authenticated) {
       throw new AppError(
         ErrorType.AUTH,
         ErrorCode.UNAUTHORIZED,
-        "Unable to sign in. Check your details or try again later."
+        "Unable to sign in. Check your details or try again later.",
       );
     }
     const { user, token } = authenticated;
@@ -124,7 +167,7 @@ usersRouter.post("/login", async (req: Request, res: Response, next: NextFunctio
       isActive: user.isActive,
       createdAt: user.createdAt.toISOString(),
       updatedAt: user.updatedAt.toISOString(),
-      token: signToken(user.walletAddress, user.sessionVersion ?? 0)
+      token,
     });
   } catch (error) {
     return next(error);

@@ -49,6 +49,15 @@ export class User {
   @Column({ type: "integer", default: 0 })
   sessionVersion!: number;
 
+  /**
+   * bcrypt hash of the user's password (#6).
+   * Null for wallet-only accounts that have never set a password.
+   * Never store a plaintext or weakly-hashed value here — use
+   * `services/password.ts` for all hashing and verification.
+   */
+  @Column({ type: "varchar", length: 72, nullable: true })
+  passwordHash!: string | null;
+
   /** When the user confirmed their email address (#1443). Null = unverified. */
   @Column({ type: "timestamptz", nullable: true })
   emailVerifiedAt!: Date | null;
